@@ -88,6 +88,27 @@ class Router:
         """Returns True if the router is actively serving."""
         return self._running
 
+    @property
+    def routing_table(self) -> RoutingTable:
+        """Returns the current RoutingTable instance used by the router."""
+        return self._routing_table
+
+    def update_routing_table(self, routing_table: RoutingTable) -> None:
+        """
+        Updates the routing table used for subsequent packet forwarding.
+
+        Args:
+            routing_table: A valid RoutingTable instance.
+
+        Raises:
+            TypeError: If routing_table is not an instance of RoutingTable.
+        """
+        if not isinstance(routing_table, RoutingTable):
+            raise TypeError(
+                f"routing_table must be a RoutingTable instance, got {type(routing_table).__name__}"
+            )
+        self._routing_table = routing_table
+
     def start(self) -> None:
         """Binds the server socket, sets options, and prepares to listen."""
         if self._server_sock is not None:

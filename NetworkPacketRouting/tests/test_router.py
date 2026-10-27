@@ -457,6 +457,29 @@ class TestRouterEngine(unittest.TestCase):
         eof_check = client.recv(1024)
         self.assertEqual(eof_check, b"")
 
+    def test_update_routing_table_valid(self) -> None:
+        """Verify update_routing_table replaces the router's active table."""
+        router = Router(host="127.0.0.1", port=0)
+        initial_table = router.routing_table
+        self.assertIsInstance(initial_table, RoutingTable)
+
+        new_table = RoutingTable(populate_default=False)
+        new_table.add_route("custom-node", "127.0.0.1", 9999)
+
+        router.update_routing_table(new_table)
+        self.assertIs(router.routing_table, new_table)
+        self.assertTrue(router.routing_table.has_route("custom-node"))
+
+    def test_update_routing_table_invalid_raises(self) -> None:
+        """Verify update_routing_table raises TypeError for non-RoutingTable argument."""
+        router = Router(host="127.0.0.1", port=0)
+        with self.assertRaises(TypeError):
+            router.update_routing_table("not-a-table")  # type: ignore
+        with self.assertRaises(TypeError):
+            router.update_routing_table(None)  # type: ignore
+        with self.assertRaises(TypeError):
+            router.update_routing_table({})  # type: ignore
+
 
 if __name__ == "__main__":
     unittest.main()
