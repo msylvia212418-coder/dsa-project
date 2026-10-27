@@ -1,0 +1,5 @@
+# DSA Network Packet Routing Simulator - Dependencies
+# Core networking and algorithms strictly use the Python standard library.
+# Streamlit is required for the interactive visual presentation dashboard.
+
+streamlit>=1.30.0
