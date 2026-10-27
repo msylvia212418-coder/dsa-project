@@ -19,7 +19,10 @@ from __future__ import annotations
 
 from typing import Optional
 
-from NetworkPacketRouting.route_planner import build_routing_table
+from NetworkPacketRouting.route_planner import (
+    build_routing_table,
+    build_weighted_routing_table,
+)
 from NetworkPacketRouting.router import DOWNSTREAM_TIMEOUT, Router
 from NetworkPacketRouting.topology import (
     InvalidNodeError,
@@ -32,17 +35,22 @@ class TopologyRouterError(Exception):
     """Base exception for topology-router factory errors."""
 
 
+class InvalidRoutingModeError(TopologyRouterError, ValueError):
+    """Raised when an unsupported routing mode is specified."""
+
+
 def create_topology_router(
     topology: NetworkTopology,
     node_id: str,
     downstream_timeout: float = DOWNSTREAM_TIMEOUT,
+    routing_mode: str = "unweighted",
 ) -> Router:
     """
     Creates and configures a Router instance for a specific node in a topology.
 
     Validates that node_id exists in the topology, queries its registered
-    (host, port) endpoint, generates its shortest-hop forwarding table via
-    build_routing_table(), and returns an unstarted Router instance.
+    (host, port) endpoint, generates its forwarding table using the chosen
+    routing mode ('unweighted' or 'weighted'), and returns an unstarted Router instance.
 
     Note:
         This factory is for nodes participating as routing switches. Nodes
@@ -55,6 +63,10 @@ def create_topology_router(
         downstream_timeout: Connection and forwarding timeout in seconds
                             when transmitting packets to downstream hops.
                             Defaults to router.DOWNSTREAM_TIMEOUT.
+        routing_mode: Pathfinding strategy used to build the router's initial
+                      forwarding table. Supported values are:
+                      - 'unweighted': BFS shortest-hop pathfinding (default).
+                      - 'weighted': Dijkstra least-cost pathfinding.
 
     Returns:
         A configured, unstarted Router instance. Call router.start() and
@@ -64,6 +76,7 @@ def create_topology_router(
         TopologyRouterError: If topology is not a NetworkTopology instance.
         InvalidNodeError: If node_id is not a valid string identifier.
         NodeNotFoundError: If node_id is not registered in the topology.
+        InvalidRoutingModeError: If routing_mode is not 'unweighted' or 'weighted'.
     """
     if not isinstance(topology, NetworkTopology):
         raise TopologyRouterError(
@@ -75,8 +88,17 @@ def create_topology_router(
             f"Node {node_id!r} is not registered in the topology"
         )
 
+    if routing_mode == "unweighted":
+        routing_table = build_routing_table(topology, node_id)
+    elif routing_mode == "weighted":
+        routing_table = build_weighted_routing_table(topology, node_id)
+    else:
+        raise InvalidRoutingModeError(
+            f"Unsupported routing mode {routing_mode!r}. "
+            f"Supported modes are: 'unweighted', 'weighted'"
+        )
+
     host, port = topology.get_endpoint(node_id)
-    routing_table = build_routing_table(topology, node_id)
 
     return Router(
         host=host,

@@ -29,7 +29,11 @@ Complexity (all expected / amortized):
 from __future__ import annotations
 
 from collections import deque
-from typing import Dict, List, Optional, Set
+import heapq
+import math
+from typing import Dict, List, Optional, Set, Tuple, Union
+
+DEFAULT_WEIGHT: int = 1
 
 
 class GraphError(Exception):
@@ -42,6 +46,18 @@ class InvalidNodeError(GraphError):
 
 class NodeNotFoundError(GraphError):
     """Raised when an operation references a node that does not exist in the graph."""
+
+
+class EdgeNotFoundError(GraphError):
+    """Raised when an operation targets an edge that does not exist in the graph."""
+
+
+class InvalidWeightError(GraphError):
+    """Raised when an edge weight is invalid (e.g. negative, non-numeric, NaN, inf, or bool)."""
+
+
+class DistanceOverflowError(GraphError, OverflowError):
+    """Raised when floating-point path distance calculation overflows to infinity."""
 
 
 def _validate_node_id(node: object) -> str:
@@ -75,27 +91,60 @@ def _validate_node_id(node: object) -> str:
     return node
 
 
+def _validate_weight(weight: object) -> Union[int, float]:
+    """
+    Validates that an edge weight is a non-negative, finite real number (int or float).
+
+    Rules:
+    - Must be an int or float.
+    - Booleans are rejected (even though bool is a subclass of int in Python).
+    - If float, must not be NaN or infinite (positive or negative infinity).
+    - If int, arbitrary-precision integers are supported and cannot be NaN/infinite.
+    - Must be non-negative (>= 0). Zero is explicitly permitted.
+
+    Returns:
+        The validated numeric weight (int or float).
+
+    Raises:
+        InvalidWeightError: If weight fails any validation check.
+    """
+    if isinstance(weight, bool) or not isinstance(weight, (int, float)):
+        raise InvalidWeightError(
+            f"Edge weight must be a numeric int or float, got {type(weight).__name__}"
+        )
+    if isinstance(weight, float):
+        if math.isnan(weight):
+            raise InvalidWeightError("Edge weight cannot be NaN")
+        if math.isinf(weight):
+            raise InvalidWeightError("Edge weight cannot be infinite")
+    if weight < 0:
+        raise InvalidWeightError(f"Edge weight must be non-negative, got {weight}")
+    return weight
+
+
 class NetworkGraph:
     """
-    Undirected, unweighted graph represented as adjacency lists.
+    Undirected, optionally weighted graph represented as adjacency lists.
 
     Each node is a string identifier (e.g. a router name). Edges connect
-    two nodes symmetrically. Internal storage uses ``dict[str, dict[str, None]]``
-    for O(1) edge-existence checks with guaranteed insertion-order iteration
-    (Python 3.7+), providing deterministic traversal without sorting.
+    two nodes symmetrically with an associated non-negative numeric weight
+    (defaulting to 1). Internal storage uses ``dict[str, dict[str, Union[int, float]]]``
+    for O(1) edge-existence and weight lookups with guaranteed insertion-order
+    iteration (Python 3.7+), providing deterministic traversal without sorting.
 
     Example::
 
         g = NetworkGraph()
-        g.add_edge("A", "B")
-        g.add_edge("A", "C")
+        g.add_edge("A", "B", weight=2.5)
+        g.add_edge("A", "C")  # defaults to weight 1
         assert g.neighbors("A") == ["B", "C"]  # insertion order
+        assert g.get_edge_weight("A", "B") == 2.5
         assert g.bfs("A") == ["A", "B", "C"]
     """
 
     def __init__(self) -> None:
         """Initializes an empty graph with no nodes or edges."""
-        self._adjacency: Dict[str, Dict[str, None]] = {}
+        self._adjacency: Dict[str, Dict[str, Union[int, float]]] = {}
 
     # ------------------------------------------------------------------
     # Node operations
@@ -172,27 +221,41 @@ class NetworkGraph:
     # Edge operations
     # ------------------------------------------------------------------
 
-    def add_edge(self, node_a: str, node_b: str) -> bool:
+    def add_edge(
+        self,
+        node_a: str,
+        node_b: str,
+        weight: Union[int, float] = DEFAULT_WEIGHT,
+    ) -> bool:
         """
-        Adds an undirected edge between two nodes.
+        Adds an undirected edge between two nodes with an optional weight.
 
         If either endpoint node does not exist, it is automatically created.
         Self-loops (node_a == node_b) are rejected.
-        Duplicate edge additions are silently ignored and return False.
+        Duplicate edge additions are silently ignored and return False without
+        mutating the existing edge or its weight.
+        Because the graph is undirected, the same weight applies symmetrically
+        in both directions: (node_a, node_b) and (node_b, node_a).
+
+        Time complexity: O(1).
+        Space complexity: O(1) amortized.
 
         Args:
             node_a: First endpoint.
             node_b: Second endpoint.
+            weight: Non-negative numeric weight (int or float). Defaults to 1.
 
         Returns:
             True if the edge was newly created, False if it already existed.
 
         Raises:
             InvalidNodeError: If either node identifier is invalid.
+            InvalidWeightError: If weight is negative, non-numeric, NaN, inf, or bool.
             GraphError: If a self-loop is attempted.
         """
         node_a = _validate_node_id(node_a)
         node_b = _validate_node_id(node_b)
+        valid_weight = _validate_weight(weight)
         if node_a == node_b:
             raise GraphError(
                 f"Self-loops are not allowed: {node_a!r}"
@@ -205,8 +268,8 @@ class NetworkGraph:
         # Check for duplicate
         if node_b in self._adjacency[node_a]:
             return False
-        self._adjacency[node_a][node_b] = None
-        self._adjacency[node_b][node_a] = None
+        self._adjacency[node_a][node_b] = valid_weight
+        self._adjacency[node_b][node_a] = valid_weight
         return True
 
     def remove_edge(self, node_a: str, node_b: str) -> bool:
@@ -256,6 +319,89 @@ class NetworkGraph:
             return False
         return node_b in self._adjacency[node_a]
 
+    def get_edge_weight(self, node_a: str, node_b: str) -> Union[int, float]:
+        """
+        Retrieves the numeric weight of an undirected edge.
+
+        Because the graph is undirected, get_edge_weight(u, v) == get_edge_weight(v, u).
+
+        Time complexity: O(1).
+
+        Args:
+            node_a: First endpoint of the edge.
+            node_b: Second endpoint of the edge.
+
+        Returns:
+            The non-negative numeric weight of the edge (int or float).
+
+        Raises:
+            InvalidNodeError: If either node identifier is invalid.
+            NodeNotFoundError: If either node does not exist in the graph.
+            EdgeNotFoundError: If no edge exists between node_a and node_b.
+        """
+        node_a = _validate_node_id(node_a)
+        node_b = _validate_node_id(node_b)
+
+        if node_a not in self._adjacency:
+            raise NodeNotFoundError(f"Node {node_a!r} does not exist in the graph")
+        if node_b not in self._adjacency:
+            raise NodeNotFoundError(f"Node {node_b!r} does not exist in the graph")
+
+        if node_b not in self._adjacency[node_a]:
+            raise EdgeNotFoundError(
+                f"Edge ({node_a!r}, {node_b!r}) does not exist in the graph"
+            )
+
+        return self._adjacency[node_a][node_b]
+
+    def edge_weight(self, node_a: str, node_b: str) -> Union[int, float]:
+        """Alias for get_edge_weight(node_a, node_b)."""
+        return self.get_edge_weight(node_a, node_b)
+
+    def set_edge_weight(
+        self, node_a: str, node_b: str, weight: Union[int, float]
+    ) -> None:
+        """
+        Updates the weight of an existing undirected edge in both directions.
+
+        Preserves existing neighbor insertion order without re-inserting keys.
+
+        Time complexity: O(1).
+
+        Args:
+            node_a: First endpoint of the edge.
+            node_b: Second endpoint of the edge.
+            weight: New non-negative numeric weight (int or float).
+
+        Raises:
+            InvalidNodeError: If either node identifier is invalid.
+            InvalidWeightError: If weight is negative, non-numeric, NaN, inf, or bool.
+            NodeNotFoundError: If either node does not exist in the graph.
+            EdgeNotFoundError: If no edge exists between node_a and node_b.
+        """
+        node_a = _validate_node_id(node_a)
+        node_b = _validate_node_id(node_b)
+        valid_weight = _validate_weight(weight)
+
+        if node_a not in self._adjacency:
+            raise NodeNotFoundError(f"Node {node_a!r} does not exist in the graph")
+        if node_b not in self._adjacency:
+            raise NodeNotFoundError(f"Node {node_b!r} does not exist in the graph")
+
+        if node_b not in self._adjacency[node_a]:
+            raise EdgeNotFoundError(
+                f"Edge ({node_a!r}, {node_b!r}) does not exist in the graph"
+            )
+
+        self._adjacency[node_a][node_b] = valid_weight
+        self._adjacency[node_b][node_a] = valid_weight
+
+    def update_edge_weight(
+        self, node_a: str, node_b: str, weight: Union[int, float]
+    ) -> None:
+        """Alias for set_edge_weight(node_a, node_b, weight)."""
+        self.set_edge_weight(node_a, node_b, weight)
+
     def edge_count(self) -> int:
         """
         Returns the number of undirected edges in the graph.
@@ -285,7 +431,7 @@ class NetworkGraph:
         node = _validate_node_id(node)
         if node not in self._adjacency:
             raise NodeNotFoundError(f"Node {node!r} does not exist in the graph")
-        return list(self._adjacency[node])
+        return list(self._adjacency[node].keys())
 
     # ------------------------------------------------------------------
     # Traversal algorithms
@@ -454,3 +600,149 @@ class NetworkGraph:
                     stack.append((neighbor, current))
 
         return parent
+
+    # ------------------------------------------------------------------
+    # Weighted Shortest Path Algorithms (Dijkstra)
+    # ------------------------------------------------------------------
+
+    def dijkstra(
+        self, source: str
+    ) -> Tuple[Dict[str, Union[int, float]], Dict[str, str]]:
+        """
+        Computes shortest paths from source to all nodes using Dijkstra's algorithm.
+
+        Uses a min-priority queue (heapq) with deterministic tie-breaking and
+        efficient skipping of stale heap entries.
+        Supports both integer and floating-point edge weights (including zero weights).
+        Preserves exact arbitrary-precision integer arithmetic for integer-only paths.
+
+        Time complexity: O((V + E) log V) where V = nodes, E = edges.
+        Space complexity: O(V + E) for priority queue, distance and predecessor maps.
+
+        Args:
+            source: The starting node identifier.
+
+        Returns:
+            A tuple of (distances, predecessors):
+            - distances: Dict[str, Union[int, float]] mapping EVERY node in the graph
+              to its shortest-path distance from source. Source distance is 0.
+              Unreachable nodes map to math.inf.
+            - predecessors: Dict[str, str] mapping each reachable non-source node
+              to its predecessor along the shortest path. The source and unreachable
+              nodes have no predecessor and are not keys in this dictionary.
+
+        Raises:
+            InvalidNodeError: If source identifier is invalid.
+            NodeNotFoundError: If source does not exist in the graph.
+            DistanceOverflowError: If floating-point distance accumulation overflows to infinity.
+        """
+        source = _validate_node_id(source)
+        if source not in self._adjacency:
+            raise NodeNotFoundError(f"Source node {source!r} does not exist in the graph")
+
+        # Initialize distances: source is 0 (exact integer), all others infinity
+        distances: Dict[str, Union[int, float]] = {
+            node: math.inf for node in self._adjacency
+        }
+        distances[source] = 0
+
+        predecessors: Dict[str, str] = {}
+        visited: Set[str] = set()
+
+        # Priority queue entries: (distance, insertion_counter, node)
+        # insertion_counter guarantees deterministic FIFO tie-breaking for equal distances
+        # and avoids comparing node names or unorderable types.
+        entry_counter = 0
+        heap: List[Tuple[Union[int, float], int, str]] = [(0, entry_counter, source)]
+
+        while heap:
+            curr_dist, _, current = heapq.heappop(heap)
+
+            # Skip stale heap entries
+            if current in visited:
+                continue
+            visited.add(current)
+
+            for neighbor, weight in self._adjacency[current].items():
+                if neighbor in visited:
+                    continue
+
+                new_dist = curr_dist + weight
+                if isinstance(new_dist, float) and math.isinf(new_dist):
+                    raise DistanceOverflowError(
+                        f"Floating-point distance overflowed to infinity between "
+                        f"{current!r} and {neighbor!r}"
+                    )
+
+                # Strict distance improvement: preserves deterministic tie-breaking
+                # and prevents predecessor cycles on zero-weight edges.
+                if new_dist < distances[neighbor]:
+                    distances[neighbor] = new_dist
+                    predecessors[neighbor] = current
+                    entry_counter += 1
+                    heapq.heappush(heap, (new_dist, entry_counter, neighbor))
+
+        return distances, predecessors
+
+    def shortest_path_weighted(
+        self, source: str, target: str
+    ) -> Optional[Tuple[List[str], Union[int, float]]]:
+        """
+        Computes the shortest weighted path and its total cost between source and target.
+
+        Reconstructs the sequence of nodes along the minimum-weight path using
+        Dijkstra's algorithm.
+
+        Time complexity: O((V + E) log V).
+        Space complexity: O(V + E).
+
+        Args:
+            source: The starting node identifier.
+            target: The destination node identifier.
+
+        Returns:
+            A tuple of (path, total_cost) if target is reachable, where:
+            - path: List[str] of node identifiers from source to target inclusive.
+            - total_cost: The non-negative numeric cost (int or float) of the path.
+            Returns ([source], 0) if source == target.
+            Returns None if target is unreachable from source.
+
+        Raises:
+            InvalidNodeError: If source or target identifier is invalid.
+            NodeNotFoundError: If source or target does not exist in the graph.
+            DistanceOverflowError: If floating-point distance accumulation overflows to infinity.
+        """
+        source = _validate_node_id(source)
+        target = _validate_node_id(target)
+
+        if source not in self._adjacency:
+            raise NodeNotFoundError(f"Source node {source!r} does not exist in the graph")
+        if target not in self._adjacency:
+            raise NodeNotFoundError(f"Target node {target!r} does not exist in the graph")
+
+        if source == target:
+            return ([source], 0)
+
+        distances, predecessors = self.dijkstra(source)
+
+        if target not in predecessors:
+            return None
+
+        # Reconstruct path from target back to source
+        path: List[str] = []
+        curr: Optional[str] = target
+        visited_nodes: Set[str] = set()
+
+        while curr is not None:
+            if curr in visited_nodes:
+                raise GraphError(
+                    f"Predecessor cycle detected at node {curr!r} during path reconstruction"
+                )
+            visited_nodes.add(curr)
+            path.append(curr)
+            if curr == source:
+                break
+            curr = predecessors.get(curr)
+
+        path.reverse()
+        return (path, distances[target])

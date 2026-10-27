@@ -31,6 +31,7 @@ from NetworkPacketRouting.topology import (
     NodeNotFoundError,
 )
 from NetworkPacketRouting.topology_router import (
+    InvalidRoutingModeError,
     TopologyRouterError,
     create_topology_router,
 )
@@ -64,6 +65,51 @@ class TestTopologyRouterFactory(unittest.TestCase):
             router._routing_table.get_route("R2"), ("127.0.0.1", 5002)
         )
         self.assertFalse(router.is_running)
+
+    def test_factory_defaults_to_unweighted_mode(self):
+        """Verify create_topology_router defaults to unweighted BFS route generation."""
+        topo = NetworkTopology()
+        topo.register_node("S", "127.0.0.1", 5001)
+        topo.register_node("R", "127.0.0.1", 5002)
+        topo.register_node("D", "127.0.0.1", 5003)
+
+        topo.connect("S", "D", weight=100)
+        topo.connect("S", "R", weight=1)
+        topo.connect("R", "D", weight=1)
+
+        router_default = create_topology_router(topo, "S")
+        # In unweighted BFS, direct 1-hop link S-D is chosen
+        self.assertEqual(
+            router_default.routing_table.get_route("D"),
+            ("127.0.0.1", 5003),
+        )
+
+    def test_factory_explicit_weighted_mode(self):
+        """Verify create_topology_router with routing_mode='weighted' uses Dijkstra."""
+        topo = NetworkTopology()
+        topo.register_node("S", "127.0.0.1", 5001)
+        topo.register_node("R", "127.0.0.1", 5002)
+        topo.register_node("D", "127.0.0.1", 5003)
+
+        topo.connect("S", "D", weight=100)
+        topo.connect("S", "R", weight=1)
+        topo.connect("R", "D", weight=1)
+
+        router_weighted = create_topology_router(topo, "S", routing_mode="weighted")
+        # In weighted mode, cheaper path S -> R -> D (cost 2) is chosen over direct (cost 100)
+        self.assertEqual(
+            router_weighted.routing_table.get_route("D"),
+            ("127.0.0.1", 5002),
+        )
+
+    def test_factory_invalid_routing_mode_raises(self):
+        """Verify unsupported routing_mode raises InvalidRoutingModeError."""
+        with self.assertRaises(InvalidRoutingModeError):
+            create_topology_router(self.topo, "R1", routing_mode="unsupported_mode")
+        with self.assertRaises(InvalidRoutingModeError):
+            create_topology_router(self.topo, "R1", routing_mode="")
+        with self.assertRaises(InvalidRoutingModeError):
+            create_topology_router(self.topo, "R1", routing_mode="WEIGHTED")
 
     def test_invalid_topology_object_raises(self):
         """Verify passing a non-NetworkTopology object raises TopologyRouterError."""
@@ -298,6 +344,110 @@ class TestMultiHopTopologyRouting(unittest.TestCase):
 
         try:
             sender_sock.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+
+    def test_multi_hop_tcp_weighted_path_cheaper_than_fewest_hop(self):
+        """
+        Verify real TCP forwarding chooses the lower-cost 2-hop route over a 1-hop expensive route.
+
+        Topology:
+            Sender -> R1 ---[cost 100]--- receiver-1 (1 hop, high cost)
+                      R1 ---[cost 1]--- R2 ---[cost 1]--- receiver-1 (2 hops, low cost 2)
+
+        With routing_mode='weighted':
+        - R1 routes to receiver-1 via R2.
+        - Packet with initial TTL=8 arrives at receiver-1 with TTL=6 (2 decrements).
+        - Sender receives DELIVERED confirmation from R1.
+        """
+        port_r1 = _find_free_port()
+        port_r2 = _find_free_port()
+        while port_r2 == port_r1:
+            port_r2 = _find_free_port()
+
+        # Set up real receiver listener
+        recv_listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        recv_listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        recv_listener.bind(("127.0.0.1", 0))
+        recv_listener.listen(5)
+        recv_listener.settimeout(3.0)
+        self.sockets.append(recv_listener)
+        port_receiver = recv_listener.getsockname()[1]
+
+        # Build topology
+        topo = NetworkTopology()
+        topo.register_node("R1", "127.0.0.1", port_r1)
+        topo.register_node("R2", "127.0.0.1", port_r2)
+        topo.register_node("receiver-1", "127.0.0.1", port_receiver)
+
+        topo.connect("R1", "receiver-1", weight=100)
+        topo.connect("R1", "R2", weight=1)
+        topo.connect("R2", "receiver-1", weight=1)
+
+        # Create weighted routers
+        router_r1 = create_topology_router(
+            topo, "R1", downstream_timeout=1.5, routing_mode="weighted"
+        )
+        router_r2 = create_topology_router(
+            topo, "R2", downstream_timeout=1.5, routing_mode="weighted"
+        )
+
+        # Verify next hops
+        self.assertEqual(
+            router_r1.routing_table.get_route("receiver-1"),
+            ("127.0.0.1", port_r2),
+        )
+        self.assertEqual(
+            router_r2.routing_table.get_route("receiver-1"),
+            ("127.0.0.1", port_receiver),
+        )
+
+        # Start routers
+        self._start_router(router_r1)
+        self._start_router(router_r2)
+
+        # Connect sender to R1
+        sender_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sender_sock.settimeout(3.0)
+        self.sockets.append(sender_sock)
+        sender_sock.connect(("127.0.0.1", port_r1))
+
+        pkt = Packet(
+            version=1,
+            src="sender-1",
+            dest="receiver-1",
+            payload="Weighted route delivery",
+            packet_id="pkt-weighted-multihop",
+            ttl=8,
+        )
+        send_frame(sender_sock, pkt.to_json_bytes())
+
+        # Sender receives DELIVERED response from R1
+        resp_bytes = recv_frame(sender_sock)
+        self.assertIsNotNone(resp_bytes)
+        resp = RouterResponse.from_json_bytes(resp_bytes)
+        self.assertEqual(resp.status, "DELIVERED")
+        self.assertEqual(resp.packet_id, "pkt-weighted-multihop")
+
+        # Receiver receives packet via R2 with TTL decremented twice (8 -> 7 -> 6)
+        conn, _ = recv_listener.accept()
+        self.sockets.append(conn)
+        conn.settimeout(3.0)
+        rx_bytes = recv_frame(conn)
+        self.assertIsNotNone(rx_bytes)
+        rx_pkt = Packet.from_json_bytes(rx_bytes)
+        self.assertEqual(rx_pkt.packet_id, "pkt-weighted-multihop")
+        self.assertEqual(rx_pkt.payload, "Weighted route delivery")
+        self.assertEqual(rx_pkt.src, "sender-1")
+        self.assertEqual(rx_pkt.dest, "receiver-1")
+        self.assertEqual(rx_pkt.ttl, 6)
+
+        try:
+            sender_sock.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+        try:
+            conn.shutdown(socket.SHUT_WR)
         except OSError:
             pass
 

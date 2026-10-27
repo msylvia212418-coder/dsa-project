@@ -23,14 +23,18 @@ Test topologies and expected visit orders are documented inline.
 
 from __future__ import annotations
 
+import math
 import sys
 import unittest
 
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent.parent.parent))
 
 from NetworkPacketRouting.graph import (
+    DistanceOverflowError,
+    EdgeNotFoundError,
     GraphError,
     InvalidNodeError,
+    InvalidWeightError,
     NetworkGraph,
     NodeNotFoundError,
 )
@@ -639,6 +643,514 @@ class TestDFSTree(unittest.TestCase):
         g = NetworkGraph()
         with self.assertRaises(NodeNotFoundError):
             g.dfs_tree("ghost")
+
+
+class TestNetworkGraphWeights(unittest.TestCase):
+    """Tests for weighted edges in NetworkGraph."""
+
+    def test_default_weight_is_one(self):
+        """Verify unweighted add_edge defaults weight to 1."""
+        g = NetworkGraph()
+        g.add_edge("A", "B")
+        self.assertEqual(g.get_edge_weight("A", "B"), 1)
+        self.assertEqual(g.get_edge_weight("B", "A"), 1)
+        self.assertEqual(g.edge_weight("A", "B"), 1)
+
+    def test_explicit_integer_and_float_weights(self):
+        """Verify integer and floating-point weights are preserved symmetrically."""
+        g = NetworkGraph()
+        g.add_edge("A", "B", weight=5)
+        g.add_edge("B", "C", weight=2.75)
+        self.assertEqual(g.get_edge_weight("A", "B"), 5)
+        self.assertEqual(g.get_edge_weight("B", "A"), 5)
+        self.assertEqual(g.get_edge_weight("B", "C"), 2.75)
+        self.assertEqual(g.get_edge_weight("C", "B"), 2.75)
+
+    def test_zero_weight_edge(self):
+        """Verify zero-weight edges (both int 0 and float 0.0) are valid."""
+        g = NetworkGraph()
+        g.add_edge("A", "B", weight=0)
+        g.add_edge("B", "C", weight=0.0)
+        self.assertEqual(g.get_edge_weight("A", "B"), 0)
+        self.assertEqual(g.get_edge_weight("B", "C"), 0.0)
+
+    def test_arbitrary_precision_large_integer_weight_accepted(self):
+        """Verify arbitrarily large non-negative Python integers are valid weights."""
+        g = NetworkGraph()
+        large_int = 10**1000
+        g.add_edge("A", "B", weight=large_int)
+        self.assertEqual(g.get_edge_weight("A", "B"), large_int)
+        self.assertEqual(g.get_edge_weight("B", "A"), large_int)
+
+        # Also test updating with large int
+        g.set_edge_weight("A", "B", 10**2000)
+        self.assertEqual(g.get_edge_weight("A", "B"), 10**2000)
+
+    def test_arbitrary_precision_large_negative_integer_rejected(self):
+        """Verify arbitrarily large negative Python integers raise InvalidWeightError."""
+        g = NetworkGraph()
+        large_neg = -(10**1000)
+        with self.assertRaises(InvalidWeightError):
+            g.add_edge("A", "B", weight=large_neg)
+
+        g.add_edge("A", "B", weight=1)
+        with self.assertRaises(InvalidWeightError):
+            g.set_edge_weight("A", "B", large_neg)
+
+    def test_negative_weight_rejected(self):
+        """Verify negative weights raise InvalidWeightError."""
+        g = NetworkGraph()
+        for neg in [-1, -0.001, -100.5, -(10**50)]:
+            with self.assertRaises(InvalidWeightError, msg=f"Should reject {neg}"):
+                g.add_edge("A", "B", weight=neg)
+
+    def test_boolean_weight_rejected(self):
+        """Verify booleans are rejected as weights even though bool inherits from int."""
+        g = NetworkGraph()
+        with self.assertRaises(InvalidWeightError):
+            g.add_edge("A", "B", weight=True)
+        with self.assertRaises(InvalidWeightError):
+            g.add_edge("A", "B", weight=False)
+
+    def test_nan_and_inf_weight_rejected(self):
+        """Verify NaN, inf, and -inf are rejected as weights."""
+        g = NetworkGraph()
+        with self.assertRaises(InvalidWeightError):
+            g.add_edge("A", "B", weight=float("nan"))
+        with self.assertRaises(InvalidWeightError):
+            g.add_edge("A", "B", weight=float("inf"))
+        with self.assertRaises(InvalidWeightError):
+            g.add_edge("A", "B", weight=float("-inf"))
+
+    def test_non_numeric_weight_rejected(self):
+        """Verify non-numeric types are rejected as weights."""
+        g = NetworkGraph()
+        for bad in ["1", "5.0", None, [1], {"w": 1}]:
+            with self.assertRaises(InvalidWeightError, msg=f"Should reject {bad!r}"):
+                g.add_edge("A", "B", weight=bad)  # type: ignore
+
+    def test_get_edge_weight_unknown_node_raises(self):
+        """Verify get_edge_weight raises NodeNotFoundError if either node is unknown."""
+        g = NetworkGraph()
+        g.add_edge("A", "B", weight=10)
+        with self.assertRaises(NodeNotFoundError):
+            g.get_edge_weight("A", "ghost")
+        with self.assertRaises(NodeNotFoundError):
+            g.get_edge_weight("ghost", "B")
+        with self.assertRaises(NodeNotFoundError):
+            g.get_edge_weight("ghost1", "ghost2")
+
+    def test_get_edge_weight_nonexistent_edge_raises(self):
+        """Verify get_edge_weight raises EdgeNotFoundError if both nodes exist but no edge exists."""
+        g = NetworkGraph()
+        g.add_node("A")
+        g.add_node("B")
+        with self.assertRaises(EdgeNotFoundError):
+            g.get_edge_weight("A", "B")
+        with self.assertRaises(EdgeNotFoundError):
+            g.get_edge_weight("B", "A")
+
+    def test_get_edge_weight_invalid_node_id_raises(self):
+        """Verify get_edge_weight validates node identifiers and raises InvalidNodeError."""
+        g = NetworkGraph()
+        g.add_edge("A", "B", 1)
+        with self.assertRaises(InvalidNodeError):
+            g.get_edge_weight("", "B")
+        with self.assertRaises(InvalidNodeError):
+            g.get_edge_weight("A", " ")
+        with self.assertRaises(InvalidNodeError):
+            g.get_edge_weight(123, "B")  # type: ignore
+
+    def test_set_edge_weight_updates_symmetrically(self):
+        """Verify set_edge_weight and update_edge_weight update weight in both directions."""
+        g = NetworkGraph()
+        g.add_edge("A", "B", weight=1)
+        self.assertEqual(g.get_edge_weight("A", "B"), 1)
+
+        g.set_edge_weight("A", "B", 7.5)
+        self.assertEqual(g.get_edge_weight("A", "B"), 7.5)
+        self.assertEqual(g.get_edge_weight("B", "A"), 7.5)
+
+        g.update_edge_weight("B", "A", 42)
+        self.assertEqual(g.get_edge_weight("A", "B"), 42)
+        self.assertEqual(g.get_edge_weight("B", "A"), 42)
+
+    def test_set_edge_weight_validation(self):
+        """Verify set_edge_weight rejects invalid weights, unknown nodes, and nonexistent edges."""
+        g = NetworkGraph()
+        g.add_edge("A", "B", weight=1)
+        g.add_node("C")
+
+        with self.assertRaises(InvalidWeightError):
+            g.set_edge_weight("A", "B", -1)
+        with self.assertRaises(InvalidWeightError):
+            g.set_edge_weight("A", "B", True)
+        with self.assertRaises(InvalidWeightError):
+            g.set_edge_weight("A", "B", float("nan"))
+        with self.assertRaises(NodeNotFoundError):
+            g.set_edge_weight("A", "ghost", 5)
+        with self.assertRaises(EdgeNotFoundError):
+            g.set_edge_weight("A", "C", 5)
+
+    def test_set_edge_weight_preserves_neighbor_order(self):
+        """Verify updating an edge weight preserves the deterministic insertion order of neighbors."""
+        g = NetworkGraph()
+        g.add_edge("A", "B", weight=1)
+        g.add_edge("A", "C", weight=2)
+        g.add_edge("A", "D", weight=3)
+        self.assertEqual(g.neighbors("A"), ["B", "C", "D"])
+
+        # Update weight of the first neighbor
+        g.set_edge_weight("A", "B", 999)
+        self.assertEqual(g.neighbors("A"), ["B", "C", "D"])
+        self.assertEqual(g.get_edge_weight("A", "B"), 999)
+
+        # Update weight of the middle neighbor
+        g.set_edge_weight("A", "C", 888)
+        self.assertEqual(g.neighbors("A"), ["B", "C", "D"])
+        self.assertEqual(g.get_edge_weight("A", "C"), 888)
+
+    def test_duplicate_add_edge_does_not_overwrite_weight(self):
+        """Verify calling add_edge on an existing edge returns False and preserves original weight."""
+        g = NetworkGraph()
+        self.assertTrue(g.add_edge("A", "B", weight=10))
+        self.assertFalse(g.add_edge("A", "B", weight=20))
+        self.assertFalse(g.add_edge("B", "A", weight=30))
+        self.assertEqual(g.get_edge_weight("A", "B"), 10)
+        self.assertEqual(g.get_edge_weight("B", "A"), 10)
+
+    def test_bfs_dfs_unaffected_by_weights(self):
+        """
+        Verify BFS and DFS traversal orders remain strictly deterministic and
+        governed by edge insertion order, completely unaffected by edge weights.
+        """
+        # Topology: A connected to B (wt=100) then C (wt=1).
+        # B connected to D (wt=50), C connected to D (wt=2).
+        g = NetworkGraph()
+        g.add_edge("A", "B", weight=100)
+        g.add_edge("A", "C", weight=1)
+        g.add_edge("B", "D", weight=50)
+        g.add_edge("C", "D", weight=2)
+
+        # BFS explores in insertion order: A -> B, C -> D (via B)
+        self.assertEqual(g.bfs("A"), ["A", "B", "C", "D"])
+        bfs_tree = g.bfs_tree("A")
+        self.assertEqual(bfs_tree["D"], "B")  # Discovered through B first
+
+        # DFS explores first-inserted first: A -> B -> D -> C
+        self.assertEqual(g.dfs("A"), ["A", "B", "D", "C"])
+
+    def test_weighted_graph_cycles_and_disconnected(self):
+        """Verify cycles and disconnected components work identically with weights."""
+        g = NetworkGraph()
+        # Component 1: triangle cycle
+        g.add_edge("A", "B", weight=3.5)
+        g.add_edge("B", "C", weight=4.0)
+        g.add_edge("C", "A", weight=1.2)
+        # Component 2: isolated weighted edge
+        g.add_edge("X", "Y", weight=0.5)
+
+        self.assertEqual(g.node_count(), 5)
+        self.assertEqual(g.edge_count(), 4)
+        self.assertEqual(g.get_edge_weight("A", "C"), 1.2)
+        self.assertEqual(g.get_edge_weight("X", "Y"), 0.5)
+        self.assertEqual(g.bfs("A"), ["A", "B", "C"])
+        self.assertEqual(g.bfs("X"), ["X", "Y"])
+
+    def test_weighted_deep_linear_graph(self):
+        """Verify deep graph with weights handles 1000+ nodes without recursion limits."""
+        g = NetworkGraph()
+        chain_len = 1000
+        for i in range(chain_len - 1):
+            g.add_edge(f"N{i}", f"N{i+1}", weight=float(i % 10))
+
+        self.assertEqual(g.node_count(), chain_len)
+        self.assertEqual(g.edge_count(), chain_len - 1)
+        self.assertEqual(g.get_edge_weight("N0", "N1"), 0.0)
+        self.assertEqual(g.get_edge_weight("N9", "N10"), 9.0)
+
+        dfs_order = g.dfs("N0")
+        self.assertEqual(len(dfs_order), chain_len)
+        self.assertEqual(dfs_order[0], "N0")
+        self.assertEqual(dfs_order[-1], f"N{chain_len - 1}")
+
+
+class TestNetworkGraphDijkstra(unittest.TestCase):
+    """Tests for Dijkstra's shortest-path algorithm and weighted pathfinding."""
+
+    def test_minimum_cost_path_has_more_hops_than_minimum_hop_path(self):
+        """
+        Verify that Dijkstra selects a lower-cost multi-hop path over a higher-cost direct link.
+
+        Topology:
+            A --(10)--> B (direct link, 1 hop, cost 10)
+            A --(1)--> C --(2)--> D --(1)--> B (multi-hop path, 3 hops, cost 4)
+        """
+        g = NetworkGraph()
+        g.add_edge("A", "B", weight=10)
+        g.add_edge("A", "C", weight=1)
+        g.add_edge("C", "D", weight=2)
+        g.add_edge("D", "B", weight=1)
+
+        # Unweighted BFS chooses direct link (1 hop)
+        self.assertEqual(g.bfs("A")[:2], ["A", "B"])
+
+        # Dijkstra chooses multi-hop path (3 hops, cost 4)
+        result = g.shortest_path_weighted("A", "B")
+        self.assertIsNotNone(result)
+        path, cost = result
+        self.assertEqual(path, ["A", "C", "D", "B"])
+        self.assertEqual(cost, 4)
+
+    def test_dijkstra_known_graph_distances_and_predecessors(self):
+        """
+        Verify Dijkstra distance and predecessor mappings against a known 5-node graph.
+
+        Edges:
+            A-B: 4, A-C: 2, C-B: 1, B-D: 5, C-D: 8, D-E: 2
+        Expected from A:
+            dist[A]=0, pred: none
+            dist[C]=2, pred[C]=A
+            dist[B]=3 (A-C-B), pred[B]=C
+            dist[D]=8 (A-C-B-D), pred[D]=B
+            dist[E]=10 (A-C-B-D-E), pred[E]=D
+        """
+        g = NetworkGraph()
+        g.add_edge("A", "B", weight=4)
+        g.add_edge("A", "C", weight=2)
+        g.add_edge("C", "B", weight=1)
+        g.add_edge("B", "D", weight=5)
+        g.add_edge("C", "D", weight=8)
+        g.add_edge("D", "E", weight=2)
+
+        distances, predecessors = g.dijkstra("A")
+
+        self.assertEqual(distances["A"], 0)
+        self.assertEqual(distances["C"], 2)
+        self.assertEqual(distances["B"], 3)
+        self.assertEqual(distances["D"], 8)
+        self.assertEqual(distances["E"], 10)
+
+        # Source has no predecessor
+        self.assertNotIn("A", predecessors)
+        self.assertEqual(predecessors["C"], "A")
+        self.assertEqual(predecessors["B"], "C")
+        self.assertEqual(predecessors["D"], "B")
+        self.assertEqual(predecessors["E"], "D")
+
+    def test_shortest_path_weighted_reconstruction(self):
+        """Verify path reconstruction produces the complete node sequence and exact cost."""
+        g = NetworkGraph()
+        g.add_edge("A", "B", weight=4)
+        g.add_edge("A", "C", weight=2)
+        g.add_edge("C", "B", weight=1)
+        g.add_edge("B", "D", weight=5)
+        g.add_edge("D", "E", weight=2)
+
+        self.assertEqual(
+            g.shortest_path_weighted("A", "E"),
+            (["A", "C", "B", "D", "E"], 10),
+        )
+        self.assertEqual(
+            g.shortest_path_weighted("A", "B"),
+            (["A", "C", "B"], 3),
+        )
+        self.assertEqual(
+            g.shortest_path_weighted("C", "E"),
+            (["C", "B", "D", "E"], 8),
+        )
+
+    def test_same_source_and_target(self):
+        """Verify querying path from a node to itself returns ([source], 0)."""
+        g = NetworkGraph()
+        g.add_edge("A", "B", weight=5)
+        g.add_node("X")
+
+        self.assertEqual(g.shortest_path_weighted("A", "A"), (["A"], 0))
+        self.assertEqual(g.shortest_path_weighted("X", "X"), (["X"], 0))
+
+    def test_unreachable_target_and_disconnected_components(self):
+        """
+        Verify that unreachable targets map to math.inf in dijkstra() with no
+        predecessor, and shortest_path_weighted() returns None.
+        """
+        g = NetworkGraph()
+        # Component 1: A-B
+        g.add_edge("A", "B", weight=2)
+        # Component 2: C-D
+        g.add_edge("C", "D", weight=3)
+        # Isolated node: Z
+        g.add_node("Z")
+
+        distances, predecessors = g.dijkstra("A")
+
+        # Every node in the graph is in distances
+        self.assertEqual(len(distances), 5)
+        self.assertEqual(distances["A"], 0)
+        self.assertEqual(distances["B"], 2)
+        self.assertEqual(distances["C"], math.inf)
+        self.assertEqual(distances["D"], math.inf)
+        self.assertEqual(distances["Z"], math.inf)
+
+        # Source and unreachable nodes have no predecessor
+        self.assertNotIn("A", predecessors)
+        self.assertEqual(predecessors["B"], "A")
+        self.assertNotIn("C", predecessors)
+        self.assertNotIn("D", predecessors)
+        self.assertNotIn("Z", predecessors)
+
+        # shortest_path_weighted returns None for unreachable targets
+        self.assertIsNone(g.shortest_path_weighted("A", "C"))
+        self.assertIsNone(g.shortest_path_weighted("A", "D"))
+        self.assertIsNone(g.shortest_path_weighted("A", "Z"))
+        self.assertIsNone(g.shortest_path_weighted("C", "A"))
+
+    def test_zero_weight_edges_and_zero_weight_cycles(self):
+        """
+        Verify that zero-weight edges and zero-weight cycles are handled without
+        infinite loops, distance degradation, or predecessor cycles.
+        """
+        g = NetworkGraph()
+        # Zero-weight triangle cycle
+        g.add_edge("A", "B", weight=0)
+        g.add_edge("B", "C", weight=0)
+        g.add_edge("C", "A", weight=0)
+        # Extension with weight
+        g.add_edge("C", "D", weight=5)
+        g.add_edge("D", "E", weight=0)
+
+        distances, predecessors = g.dijkstra("A")
+
+        self.assertEqual(distances["A"], 0)
+        self.assertEqual(distances["B"], 0)
+        self.assertEqual(distances["C"], 0)
+        self.assertEqual(distances["D"], 5)
+        self.assertEqual(distances["E"], 5)
+
+        # Source A has no predecessor
+        self.assertNotIn("A", predecessors)
+
+        # Reconstructed path must be valid and acyclic
+        result = g.shortest_path_weighted("A", "E")
+        self.assertIsNotNone(result)
+        path, cost = result
+        self.assertEqual(cost, 5)
+        self.assertEqual(path[0], "A")
+        self.assertEqual(path[-1], "E")
+        # Ensure path contains no duplicate nodes (no cycle)
+        self.assertEqual(len(path), len(set(path)))
+
+    def test_floating_point_edge_weights(self):
+        """Verify Dijkstra supports float weights with exact fractional sums."""
+        g = NetworkGraph()
+        g.add_edge("A", "B", weight=1.25)
+        g.add_edge("B", "C", weight=2.5)
+        g.add_edge("A", "C", weight=4.0)
+
+        result = g.shortest_path_weighted("A", "C")
+        self.assertIsNotNone(result)
+        path, cost = result
+        self.assertEqual(path, ["A", "B", "C"])
+        self.assertEqual(cost, 3.75)
+
+    def test_equal_cost_alternatives_deterministic_results(self):
+        """
+        Verify equal-cost alternative routes produce deterministic results
+        across repeated invocations.
+        """
+        g = NetworkGraph()
+        # Diamond topology with identical weights on both sides
+        g.add_edge("A", "B", weight=3)
+        g.add_edge("A", "C", weight=3)
+        g.add_edge("B", "D", weight=2)
+        g.add_edge("C", "D", weight=2)
+
+        # Because B was inserted before C, A->B is explored first and settled first
+        first_run = g.shortest_path_weighted("A", "D")
+        self.assertIsNotNone(first_run)
+
+        for _ in range(10):
+            subsequent_run = g.shortest_path_weighted("A", "D")
+            self.assertEqual(subsequent_run, first_run)
+
+    def test_invalid_and_nonexistent_nodes_raise(self):
+        """Verify dijkstra and shortest_path_weighted validate node arguments."""
+        g = NetworkGraph()
+        g.add_edge("A", "B", weight=1)
+
+        # Invalid node identifiers
+        for bad in ["", " ", None, 123, " A"]:
+            with self.assertRaises(InvalidNodeError):
+                g.dijkstra(bad)  # type: ignore
+            with self.assertRaises(InvalidNodeError):
+                g.shortest_path_weighted(bad, "B")  # type: ignore
+            with self.assertRaises(InvalidNodeError):
+                g.shortest_path_weighted("A", bad)  # type: ignore
+
+        # Nonexistent nodes
+        with self.assertRaises(NodeNotFoundError):
+            g.dijkstra("ghost")
+        with self.assertRaises(NodeNotFoundError):
+            g.shortest_path_weighted("ghost", "B")
+        with self.assertRaises(NodeNotFoundError):
+            g.shortest_path_weighted("A", "ghost")
+
+    def test_arbitrary_precision_large_integer_path_costs(self):
+        """
+        Verify exact integer arithmetic is preserved for integer-only paths
+        with very large numbers without converting to float or losing precision.
+        """
+        g = NetworkGraph()
+        w1 = 10**500
+        w2 = 2 * (10**500)
+        g.add_edge("A", "B", weight=w1)
+        g.add_edge("B", "C", weight=w2)
+
+        distances, _ = g.dijkstra("A")
+        self.assertEqual(distances["C"], 3 * (10**500))
+        self.assertIsInstance(distances["C"], int)
+
+        path_result = g.shortest_path_weighted("A", "C")
+        self.assertIsNotNone(path_result)
+        path, cost = path_result
+        self.assertEqual(path, ["A", "B", "C"])
+        self.assertEqual(cost, 3 * (10**500))
+        self.assertIsInstance(cost, int)
+
+    def test_floating_point_overflow_raises_distance_overflow_error(self):
+        """
+        Verify that when finite float edge weights sum to infinity through float overflow,
+        DistanceOverflowError is explicitly raised rather than treating the node as disconnected.
+        """
+        g = NetworkGraph()
+        g.add_edge("A", "B", weight=1e308)
+        g.add_edge("B", "C", weight=1e308)
+
+        with self.assertRaises(DistanceOverflowError):
+            g.dijkstra("A")
+
+        with self.assertRaises(DistanceOverflowError):
+            g.shortest_path_weighted("A", "C")
+
+    def test_dijkstra_does_not_mutate_graph(self):
+        """Verify calling dijkstra and shortest_path_weighted leaves the graph unchanged."""
+        g = NetworkGraph()
+        g.add_edge("A", "B", weight=3)
+        g.add_edge("B", "C", weight=4)
+        g.add_edge("A", "C", weight=10)
+
+        nodes_before = g.nodes()
+        edges_before = g.edge_count()
+        neighbors_a_before = g.neighbors("A")
+        weight_ab_before = g.get_edge_weight("A", "B")
+
+        g.dijkstra("A")
+        g.shortest_path_weighted("A", "C")
+
+        self.assertEqual(g.nodes(), nodes_before)
+        self.assertEqual(g.edge_count(), edges_before)
+        self.assertEqual(g.neighbors("A"), neighbors_a_before)
+        self.assertEqual(g.get_edge_weight("A", "B"), weight_ab_before)
 
 
 if __name__ == "__main__":

@@ -16,12 +16,20 @@ from __future__ import annotations
 
 import unittest
 
-from NetworkPacketRouting.graph import InvalidNodeError, NetworkGraph
+from NetworkPacketRouting.graph import (
+    DEFAULT_WEIGHT,
+    DistanceOverflowError,
+    EdgeNotFoundError,
+    InvalidNodeError,
+    InvalidWeightError,
+    NetworkGraph,
+)
 from NetworkPacketRouting.topology import (
     DuplicateEndpointError,
     DuplicateNodeError,
     InvalidEndpointError,
     LinkError,
+    LinkNotFoundError,
     NetworkTopology,
     NodeNotFoundError,
     TopologyError,
@@ -682,6 +690,262 @@ class TestTopologyDefensiveCopies(unittest.TestCase):
         self.assertFalse(graph_copy.has_edge("B", "C"))
         self.assertEqual(graph_copy.node_count(), 2)
         self.assertEqual(graph_copy.edge_count(), 1)
+
+
+class TestTopologyWeightedLinks(unittest.TestCase):
+    """Tests for weighted link operations in NetworkTopology."""
+
+    def setUp(self):
+        self.topo = NetworkTopology()
+        self.topo.register_node("A", "10.0.0.1", 5001)
+        self.topo.register_node("B", "10.0.0.2", 5002)
+        self.topo.register_node("C", "10.0.0.3", 5003)
+
+    def test_unweighted_connect_defaults_weight_to_one(self):
+        """Verify connect() without weight defaults to DEFAULT_WEIGHT (1)."""
+        self.assertTrue(self.topo.connect("A", "B"))
+        self.assertEqual(self.topo.get_link_weight("A", "B"), 1)
+        self.assertEqual(self.topo.get_link_weight("B", "A"), 1)
+        self.assertEqual(self.topo.link_weight("A", "B"), 1)
+
+    def test_explicit_integer_and_float_and_zero_weights(self):
+        """Verify connect() with integer, float, and zero weights."""
+        self.assertTrue(self.topo.connect("A", "B", weight=42))
+        self.assertEqual(self.topo.get_link_weight("A", "B"), 42)
+        self.assertEqual(self.topo.get_link_weight("B", "A"), 42)
+
+        self.assertTrue(self.topo.connect("B", "C", weight=2.718))
+        self.assertEqual(self.topo.get_link_weight("B", "C"), 2.718)
+        self.assertEqual(self.topo.get_link_weight("C", "B"), 2.718)
+
+        # Zero weight
+        self.topo.register_node("Z", "10.0.0.4", 5004)
+        self.assertTrue(self.topo.connect("A", "Z", weight=0))
+        self.assertEqual(self.topo.get_link_weight("A", "Z"), 0)
+
+        # Zero float weight
+        self.topo.register_node("Z0", "10.0.0.5", 5005)
+        self.assertTrue(self.topo.connect("B", "Z0", weight=0.0))
+        self.assertEqual(self.topo.get_link_weight("B", "Z0"), 0.0)
+
+    def test_large_integer_weight(self):
+        """Verify arbitrary-precision large integers work as weights."""
+        large_weight = 10**1000
+        self.assertTrue(self.topo.connect("A", "B", weight=large_weight))
+        self.assertEqual(self.topo.get_link_weight("A", "B"), large_weight)
+        self.assertEqual(self.topo.get_link_weight("B", "A"), large_weight)
+
+    def test_add_link_alias_with_weight(self):
+        """Verify add_link() alias supports explicit weight."""
+        self.assertTrue(self.topo.add_link("A", "B", weight=3.5))
+        self.assertEqual(self.topo.get_link_weight("A", "B"), 3.5)
+        self.assertEqual(self.topo.link_weight("B", "A"), 3.5)
+
+    def test_invalid_weights_raise_invalid_weight_error(self):
+        """Verify invalid weights are rejected and link is not created."""
+        invalid_weights = [
+            -1,
+            -0.001,
+            -10**1000,
+            True,
+            False,
+            "weight",
+            None,
+            [1],
+            float("nan"),
+            float("inf"),
+            float("-inf"),
+        ]
+        for w in invalid_weights:
+            with self.subTest(weight=w):
+                with self.assertRaises(InvalidWeightError):
+                    self.topo.connect("A", "B", weight=w)
+                self.assertFalse(self.topo.has_link("A", "B"))
+
+    def test_duplicate_connect_does_not_overwrite_weight(self):
+        """Verify duplicate connect() returns False and preserves original weight."""
+        self.assertTrue(self.topo.connect("A", "B", weight=5))
+        self.assertFalse(self.topo.connect("A", "B", weight=10))
+        self.assertEqual(self.topo.get_link_weight("A", "B"), 5)
+
+        # Reverse order duplicate attempt
+        self.assertFalse(self.topo.connect("B", "A", weight=20))
+        self.assertEqual(self.topo.get_link_weight("A", "B"), 5)
+        self.assertEqual(self.topo.get_link_weight("B", "A"), 5)
+
+    def test_set_link_weight_updates_weight_symmetrically(self):
+        """Verify set_link_weight updates weight for existing link."""
+        self.topo.connect("A", "B", weight=1)
+        self.topo.set_link_weight("A", "B", 9.5)
+        self.assertEqual(self.topo.get_link_weight("A", "B"), 9.5)
+        self.assertEqual(self.topo.get_link_weight("B", "A"), 9.5)
+
+    def test_set_link_weight_validation_and_errors(self):
+        """Verify set_link_weight raises expected errors on invalid arguments."""
+        self.topo.connect("A", "B", weight=1)
+
+        # Invalid weight
+        with self.assertRaises(InvalidWeightError):
+            self.topo.set_link_weight("A", "B", -5)
+        with self.assertRaises(InvalidWeightError):
+            self.topo.set_link_weight("A", "B", True)
+
+        # Unknown nodes
+        with self.assertRaises(NodeNotFoundError):
+            self.topo.set_link_weight("ghost", "A", 5)
+        with self.assertRaises(NodeNotFoundError):
+            self.topo.set_link_weight("A", "ghost", 5)
+
+        # Invalid node ID
+        with self.assertRaises(InvalidNodeError):
+            self.topo.set_link_weight("", "A", 5)
+
+        # Nonexistent link between registered nodes
+        with self.assertRaises(LinkNotFoundError):
+            self.topo.set_link_weight("A", "C", 5)
+
+    def test_get_link_weight_unknown_node_raises_node_not_found(self):
+        """Verify querying link weight with unregistered nodes raises NodeNotFoundError."""
+        self.topo.connect("A", "B", weight=3)
+        with self.assertRaises(NodeNotFoundError):
+            self.topo.get_link_weight("ghost", "A")
+        with self.assertRaises(NodeNotFoundError):
+            self.topo.get_link_weight("A", "ghost")
+
+    def test_get_link_weight_invalid_node_id_raises_invalid_node_error(self):
+        """Verify querying link weight with invalid node IDs raises InvalidNodeError."""
+        with self.assertRaises(InvalidNodeError):
+            self.topo.get_link_weight("", "A")
+        with self.assertRaises(InvalidNodeError):
+            self.topo.get_link_weight("A", None)
+
+    def test_get_link_weight_absent_link_raises_link_not_found(self):
+        """Verify querying weight for absent link between registered nodes raises LinkNotFoundError."""
+        with self.assertRaises(LinkNotFoundError):
+            self.topo.get_link_weight("A", "B")
+        # Also verify it is a LinkError and EdgeNotFoundError
+        with self.assertRaises(LinkError):
+            self.topo.get_link_weight("A", "B")
+        with self.assertRaises(EdgeNotFoundError):
+            self.topo.get_link_weight("A", "B")
+
+    def test_get_link_weight_self_loop_raises_link_not_found(self):
+        """Verify querying weight for a self-loop raises LinkNotFoundError."""
+        with self.assertRaises(LinkNotFoundError):
+            self.topo.get_link_weight("A", "A")
+
+
+class TestTopologyWeightedShortestPath(unittest.TestCase):
+    """Tests for shortest_path_weighted() and algorithm comparison."""
+
+    def setUp(self):
+        self.topo = NetworkTopology()
+        for i in range(1, 7):
+            self.topo.register_node(f"R{i}", f"10.0.0.{i}", 5000 + i)
+
+    def test_weighted_shortest_path_min_cost_vs_min_hops(self):
+        """
+        Verify weighted shortest path selects lower cost route over fewer hops.
+
+        Topology:
+          R1 ---[cost 10]--- R2
+          R1 ---[cost 2]--- R3 ---[cost 2]--- R4 ---[cost 2]--- R2
+
+        Unweighted BFS shortest path: R1 -> R2 (1 hop)
+        Weighted Dijkstra shortest path: R1 -> R3 -> R4 -> R2 (cost 6, 3 hops)
+        """
+        self.topo.connect("R1", "R2", weight=10)
+        self.topo.connect("R1", "R3", weight=2)
+        self.topo.connect("R3", "R4", weight=2)
+        self.topo.connect("R4", "R2", weight=2)
+
+        # Unweighted BFS must remain 1 hop R1 -> R2
+        self.assertEqual(self.topo.shortest_path("R1", "R2"), ["R1", "R2"])
+        self.assertEqual(self.topo.next_hop("R1", "R2"), "R2")
+
+        # Weighted shortest path must choose the 3-hop route with cost 6
+        result = self.topo.shortest_path_weighted("R1", "R2")
+        self.assertIsNotNone(result)
+        path, cost = result
+        self.assertEqual(path, ["R1", "R3", "R4", "R2"])
+        self.assertEqual(cost, 6)
+
+        # Reverse direction symmetric
+        rev_result = self.topo.shortest_path_weighted("R2", "R1")
+        self.assertIsNotNone(rev_result)
+        rev_path, rev_cost = rev_result
+        self.assertEqual(rev_path, ["R2", "R4", "R3", "R1"])
+        self.assertEqual(rev_cost, 6)
+
+    def test_weighted_shortest_path_with_keyword_target(self):
+        """Verify shortest_path_weighted supports target= keyword argument."""
+        self.topo.connect("R1", "R2", weight=5)
+        result = self.topo.shortest_path_weighted("R1", target="R2")
+        self.assertEqual(result, (["R1", "R2"], 5))
+
+    def test_weighted_shortest_path_source_equals_destination(self):
+        """Verify source == destination returns ([source], 0)."""
+        result = self.topo.shortest_path_weighted("R1", "R1")
+        self.assertEqual(result, (["R1"], 0))
+
+    def test_weighted_shortest_path_unreachable_node_returns_none(self):
+        """Verify unreachable node in a disconnected component returns None."""
+        self.topo.connect("R1", "R2", weight=1)
+        self.topo.connect("R3", "R4", weight=1)
+        self.assertIsNone(self.topo.shortest_path_weighted("R1", "R4"))
+
+    def test_weighted_shortest_path_unregistered_nodes_raise(self):
+        """Verify unregistered source or destination raises NodeNotFoundError."""
+        with self.assertRaises(NodeNotFoundError):
+            self.topo.shortest_path_weighted("ghost", "R1")
+        with self.assertRaises(NodeNotFoundError):
+            self.topo.shortest_path_weighted("R1", "ghost")
+
+    def test_weighted_shortest_path_invalid_identifiers_raise(self):
+        """Verify invalid identifiers raise InvalidNodeError."""
+        with self.assertRaises(InvalidNodeError):
+            self.topo.shortest_path_weighted("", "R1")
+        with self.assertRaises(InvalidNodeError):
+            self.topo.shortest_path_weighted("R1", None)
+        with self.assertRaises(TypeError):
+            self.topo.shortest_path_weighted("R1")
+
+    def test_weighted_shortest_path_zero_weight_links_and_cycles(self):
+        """Verify zero-weight links and cycles do not cause infinite loops."""
+        self.topo.connect("R1", "R2", weight=0)
+        self.topo.connect("R2", "R3", weight=0)
+        self.topo.connect("R3", "R1", weight=5)  # Cycle
+        self.topo.connect("R3", "R4", weight=1.5)
+
+        result = self.topo.shortest_path_weighted("R1", "R4")
+        self.assertIsNotNone(result)
+        path, cost = result
+        self.assertEqual(path, ["R1", "R2", "R3", "R4"])
+        self.assertEqual(cost, 1.5)
+
+    def test_defensive_copy_preserves_link_weights(self):
+        """Verify get_graph() creates an independent defensive copy preserving weights."""
+        self.topo.connect("R1", "R2", weight=7.5)
+        graph_copy = self.topo.get_graph()
+
+        self.assertEqual(graph_copy.get_edge_weight("R1", "R2"), 7.5)
+
+        # Mutating copy doesn't alter topology
+        graph_copy.set_edge_weight("R1", "R2", 100)
+        self.assertEqual(self.topo.get_link_weight("R1", "R2"), 7.5)
+
+        # Mutating topology doesn't alter previously taken copy
+        self.topo.set_link_weight("R1", "R2", 25)
+        self.assertEqual(graph_copy.get_edge_weight("R1", "R2"), 100)
+        self.assertEqual(self.topo.get_link_weight("R1", "R2"), 25)
+
+    def test_endpoint_registration_independent_of_weights(self):
+        """Verify endpoint registration is completely unaffected by link weights."""
+        self.topo.connect("R1", "R2", weight=99)
+        self.assertEqual(self.topo.get_endpoint("R1"), ("10.0.0.1", 5001))
+        self.assertEqual(self.topo.get_endpoint("R2"), ("10.0.0.2", 5002))
+        self.assertEqual(self.topo.node_count(), 6)
+        self.assertEqual(self.topo.link_count(), 1)
 
 
 if __name__ == "__main__":

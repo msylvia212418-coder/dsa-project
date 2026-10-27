@@ -1,5 +1,5 @@
 """
-topology.py - Network topology representation and shortest-hop pathfinding.
+topology.py - Network topology representation, unweighted BFS, and weighted pathfinding.
 
 This module provides the NetworkTopology class, which models an interconnected
 network of routers/nodes. It composes a NetworkGraph for topological structure
@@ -9,27 +9,36 @@ Pathfinding algorithms:
 - shortest_path(source, destination): Computes the minimum-hop path using
   Breadth-First Search (BFS).
 - next_hop(source, destination): Determines the immediate forwarding hop
-  along the computed shortest path.
+  along the computed unweighted shortest path.
+- shortest_path_weighted(source, destination): Computes the minimum-cost
+  path and total numeric weight using Dijkstra's algorithm.
 
 Tie-breaking policy:
-When multiple paths have the exact same minimum hop count, traversal order
-is strictly deterministic and follows the edge insertion order of the
-underlying NetworkGraph. Specifically, BFS explores neighbors in the order
-they were connected to each node; the neighbor connected earlier is dequeued
-and explored first, so the path passing through the earlier-connected edge
-is selected.
+- For unweighted BFS (shortest_path): When multiple paths have the exact same
+  minimum hop count, traversal order is strictly deterministic and follows the
+  edge insertion order of the underlying NetworkGraph.
+- For Dijkstra (shortest_path_weighted): When multiple paths have identical minimum
+  costs, ties are broken deterministically as implemented in NetworkGraph.dijkstra().
 """
 
 from __future__ import annotations
 
 from collections import deque
 import copy
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple, Union
 
-from NetworkPacketRouting.graph import InvalidNodeError, NetworkGraph
+from NetworkPacketRouting.graph import (
+    DEFAULT_WEIGHT,
+    DistanceOverflowError,
+    EdgeNotFoundError,
+    InvalidNodeError,
+    InvalidWeightError,
+    NetworkGraph,
+)
 
 MIN_PORT: int = 1
 MAX_PORT: int = 65535
+_UNSET: object = object()
 
 
 class TopologyError(Exception):
@@ -54,6 +63,10 @@ class DuplicateEndpointError(TopologyError):
 
 class LinkError(TopologyError):
     """Raised when a link operation is invalid (e.g. self-loop)."""
+
+
+class LinkNotFoundError(LinkError, EdgeNotFoundError):
+    """Raised when an operation targets a link that does not exist in the topology."""
 
 
 def _validate_node_id(node: object) -> str:
@@ -285,13 +298,20 @@ class NetworkTopology:
     # Link Management
     # ------------------------------------------------------------------
 
-    def connect(self, node_a: str, node_b: str) -> bool:
+    def connect(
+        self,
+        node_a: str,
+        node_b: str,
+        weight: Union[int, float] = DEFAULT_WEIGHT,
+    ) -> bool:
         """
-        Creates an undirected link between two registered nodes.
+        Creates an undirected link between two registered nodes with an optional weight.
 
         Args:
             node_a: First node identifier.
             node_b: Second node identifier.
+            weight: Non-negative finite numeric weight (int or float).
+                    Defaults to DEFAULT_WEIGHT (1).
 
         Returns:
             True if the link was newly created, False if it already existed.
@@ -300,6 +320,7 @@ class NetworkTopology:
             InvalidNodeError: If either node identifier is invalid.
             NodeNotFoundError: If either node is not registered in the topology.
             LinkError: If attempting to connect a node to itself (self-loop).
+            InvalidWeightError: If weight is negative, boolean, non-numeric, NaN, or infinite.
         """
         valid_a = _validate_node_id(node_a)
         valid_b = _validate_node_id(node_b)
@@ -315,11 +336,16 @@ class NetworkTopology:
         if valid_a == valid_b:
             raise LinkError(f"Self-loops are not allowed: {valid_a!r}")
 
-        return self._graph.add_edge(valid_a, valid_b)
+        return self._graph.add_edge(valid_a, valid_b, weight=weight)
 
-    def add_link(self, node_a: str, node_b: str) -> bool:
-        """Alias for connect(node_a, node_b)."""
-        return self.connect(node_a, node_b)
+    def add_link(
+        self,
+        node_a: str,
+        node_b: str,
+        weight: Union[int, float] = DEFAULT_WEIGHT,
+    ) -> bool:
+        """Alias for connect(node_a, node_b, weight=weight)."""
+        return self.connect(node_a, node_b, weight=weight)
 
     def disconnect(self, node_a: str, node_b: str) -> bool:
         """
@@ -379,6 +405,83 @@ class NetworkTopology:
     def link_count(self) -> int:
         """Returns the total number of undirected links in the topology."""
         return self._graph.edge_count()
+
+    def get_link_weight(self, node_a: str, node_b: str) -> Union[int, float]:
+        """
+        Retrieves the numeric weight of an undirected link between two registered nodes.
+
+        Because links are undirected, get_link_weight(u, v) == get_link_weight(v, u).
+
+        Args:
+            node_a: First node identifier.
+            node_b: Second node identifier.
+
+        Returns:
+            The non-negative numeric weight of the link (int or float).
+
+        Raises:
+            InvalidNodeError: If either node identifier is invalid.
+            NodeNotFoundError: If either node is not registered in the topology.
+            LinkNotFoundError: If no link exists between node_a and node_b.
+        """
+        valid_a = _validate_node_id(node_a)
+        valid_b = _validate_node_id(node_b)
+
+        if valid_a not in self._endpoints:
+            raise NodeNotFoundError(
+                f"Node {valid_a!r} is not registered in the topology"
+            )
+        if valid_b not in self._endpoints:
+            raise NodeNotFoundError(
+                f"Node {valid_b!r} is not registered in the topology"
+            )
+
+        if not self._graph.has_edge(valid_a, valid_b):
+            raise LinkNotFoundError(
+                f"Link between {valid_a!r} and {valid_b!r} does not exist in the topology"
+            )
+
+        return self._graph.get_edge_weight(valid_a, valid_b)
+
+    def link_weight(self, node_a: str, node_b: str) -> Union[int, float]:
+        """Alias for get_link_weight(node_a, node_b)."""
+        return self.get_link_weight(node_a, node_b)
+
+    def set_link_weight(
+        self, node_a: str, node_b: str, weight: Union[int, float]
+    ) -> None:
+        """
+        Updates the numeric weight of an existing undirected link.
+
+        Args:
+            node_a: First node identifier.
+            node_b: Second node identifier.
+            weight: Non-negative finite numeric weight (int or float).
+
+        Raises:
+            InvalidNodeError: If either node identifier is invalid.
+            NodeNotFoundError: If either node is not registered in the topology.
+            LinkNotFoundError: If no link exists between node_a and node_b.
+            InvalidWeightError: If weight is negative, boolean, non-numeric, NaN, or infinite.
+        """
+        valid_a = _validate_node_id(node_a)
+        valid_b = _validate_node_id(node_b)
+
+        if valid_a not in self._endpoints:
+            raise NodeNotFoundError(
+                f"Node {valid_a!r} is not registered in the topology"
+            )
+        if valid_b not in self._endpoints:
+            raise NodeNotFoundError(
+                f"Node {valid_b!r} is not registered in the topology"
+            )
+
+        if not self._graph.has_edge(valid_a, valid_b):
+            raise LinkNotFoundError(
+                f"Link between {valid_a!r} and {valid_b!r} does not exist in the topology"
+            )
+
+        self._graph.set_edge_weight(valid_a, valid_b, weight)
 
     def neighbors(self, node: str) -> List[str]:
         """
@@ -514,3 +617,61 @@ class NetworkTopology:
         if path is None or len(path) < 2:
             return None
         return path[1]
+
+    def shortest_path_weighted(
+        self,
+        source: str,
+        destination: object = _UNSET,
+        *,
+        target: object = _UNSET,
+    ) -> Optional[Tuple[List[str], Union[int, float]]]:
+        """
+        Computes the shortest weighted path and its total cost using Dijkstra's algorithm.
+
+        Delegates to the underlying NetworkGraph's Dijkstra implementation.
+        Validates node identifiers and verifies that both nodes are registered
+        in the topology's endpoint registry.
+
+        Args:
+            source: Starting node identifier.
+            destination: Target node identifier (positional or keyword).
+            target: Keyword alias for destination.
+
+        Returns:
+            A tuple of (path, total_cost) if destination is reachable, where:
+            - path: List[str] of node identifiers from source to destination inclusive.
+            - total_cost: The non-negative numeric cost (int or float) of the path.
+            Returns ([source], 0) if source == destination.
+            Returns None if destination is unreachable from source.
+
+        Raises:
+            TypeError: If neither destination nor target is provided.
+            InvalidNodeError: If source or destination identifier is invalid.
+            NodeNotFoundError: If source or destination is not registered in the topology.
+            DistanceOverflowError: If floating-point distance calculation overflows to infinity.
+        """
+        if destination is not _UNSET:
+            dest = destination
+        elif target is not _UNSET:
+            dest = target
+        else:
+            raise TypeError(
+                "shortest_path_weighted() missing 1 required positional argument: 'destination'"
+            )
+
+        valid_source = _validate_node_id(source)
+        valid_dest = _validate_node_id(dest)
+
+        if valid_source not in self._endpoints:
+            raise NodeNotFoundError(
+                f"Source node {valid_source!r} is not registered in the topology"
+            )
+        if valid_dest not in self._endpoints:
+            raise NodeNotFoundError(
+                f"Destination node {valid_dest!r} is not registered in the topology"
+            )
+
+        if valid_source == valid_dest:
+            return ([valid_source], 0)
+
+        return self._graph.shortest_path_weighted(valid_source, valid_dest)
