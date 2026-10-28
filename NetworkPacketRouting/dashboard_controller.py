@@ -432,10 +432,42 @@ def simulate_packet_forwarding(
         current_node = next_hop_node
         hops_traversed.append(current_node)
 
+        # Immediate loop detection: If next node was already visited, abort cycle
+        if current_node in hops_traversed[:-1]:
+            status = "DROPPED_LOOP"
+            summary = f"Forwarding loop detected at node {current_node}. Packet dropped."
+            steps.append(
+                SimulationStep(
+                    hop_number=hop_count + 1,
+                    current_node=current_node,
+                    incoming_ttl=current_ttl,
+                    outgoing_ttl=0,
+                    action="DROP",
+                    next_hop=None,
+                    status="DROPPED_LOOP",
+                    detail=summary,
+                )
+            )
+            current_ttl = 0
+            break
+
     else:
         # Loop limit exceeded
         status = "DROPPED_HOPS_EXCEEDED"
         summary = f"Forwarding exceeded maximum hop limit ({max_hops}). Possible forwarding cycle."
+        steps.append(
+            SimulationStep(
+                hop_number=hop_count,
+                current_node=current_node,
+                incoming_ttl=current_ttl,
+                outgoing_ttl=0,
+                action="DROP",
+                next_hop=None,
+                status="DROPPED_HOPS_EXCEEDED",
+                detail=summary,
+            )
+        )
+        current_ttl = 0
 
     return SimulationResult(
         packet_id=packet.packet_id,
@@ -487,7 +519,7 @@ def generate_graphviz_dot(
         '    bgcolor="transparent";',
         '    rankdir=LR;',
         '    node [fontname="Helvetica, Arial, sans-serif", fontsize=11, fontcolor="#F8FAFC"];',
-        '    edge [fontname="Helvetica, Arial, sans-serif", fontsize=10, fontcolor="#94A3B8"];',
+        '    edge [fontname="Helvetica, Arial, sans-serif", fontsize=11, fontcolor="#0F172A"];',
     ]
 
     nodes = topology.nodes()
@@ -531,19 +563,19 @@ def generate_graphviz_dot(
                 dot_lines.append(
                     f'    "{html.escape(pair[0])}" -- "{html.escape(pair[1])}" ['
                     f'label=" {weight} (SEVERED) ", style="dashed", '
-                    f'color="#EF4444", penwidth=2.5, fontcolor="#EF4444"];'
+                    f'color="#EF4444", penwidth=2.5, fontcolor="#DC2626"];'
                 )
             elif is_highlighted:
                 dot_lines.append(
                     f'    "{html.escape(pair[0])}" -- "{html.escape(pair[1])}" ['
                     f'label=" {weight} ", '
-                    f'color="#F59E0B", penwidth=3.5, fontcolor="#FBBF24", weight=2];'
+                    f'color="#F59E0B", penwidth=3.5, fontcolor="#B45309", weight=2];'
                 )
             else:
                 dot_lines.append(
                     f'    "{html.escape(pair[0])}" -- "{html.escape(pair[1])}" ['
                     f'label=" {weight} ", '
-                    f'color="#64748B", penwidth=1.5, fontcolor="#94A3B8"];'
+                    f'color="#64748B", penwidth=1.5, fontcolor="#1E293B"];'
                 )
 
     # Render any failed links between registered nodes that were severed/removed from topology
@@ -552,7 +584,7 @@ def generate_graphviz_dot(
             dot_lines.append(
                 f'    "{html.escape(pair[0])}" -- "{html.escape(pair[1])}" ['
                 f'label=" SEVERED ", style="dashed", '
-                f'color="#EF4444", penwidth=2.5, fontcolor="#EF4444"];'
+                f'color="#EF4444", penwidth=2.5, fontcolor="#DC2626"];'
             )
 
     dot_lines.append('}')

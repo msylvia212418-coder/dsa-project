@@ -213,6 +213,91 @@ class TestDashboardController(unittest.TestCase):
         # Failed/severed edge styling
         self.assertIn('SEVERED', dot)
 
+    def test_compare_routes_r2_to_r1_divergence(self):
+        """Verify that R2 -> R1 correctly computes BFS (1 hop, cost 100) vs Dijkstra (2 hops, cost 4)."""
+        res = compare_routes(self.topo, "R2", "R1")
+
+        self.assertEqual(res.source, "R2")
+        self.assertEqual(res.destination, "R1")
+        self.assertEqual(res.bfs_path, ["R2", "R1"])
+        self.assertEqual(res.bfs_hops, 1)
+        self.assertEqual(res.bfs_cost, 100)
+        self.assertEqual(res.bfs_next_hop, "R1")
+
+        self.assertEqual(res.dijkstra_path, ["R2", "R3", "R1"])
+        self.assertEqual(res.dijkstra_hops, 2)
+        self.assertEqual(res.dijkstra_cost, 4)
+        self.assertEqual(res.dijkstra_next_hop, "R3")
+
+        self.assertTrue(res.is_different_path)
+        self.assertTrue(res.is_cost_divergence)
+
+    def test_simulate_packet_forwarding_r2_to_r1_weighted(self):
+        """Verify exact R2 -> R1 weighted simulation delivers to R1 via R3 with accurate trace."""
+        res = simulate_packet_forwarding(
+            self.topo,
+            source="R2",
+            destination="R1",
+            payload="Regression Check R2->R1",
+            initial_ttl=8,
+            routing_mode="weighted",
+        )
+
+        self.assertTrue(res.delivered)
+        self.assertEqual(res.status, "DELIVERED")
+        self.assertEqual(res.source, "R2")
+        self.assertEqual(res.destination, "R1")
+        self.assertEqual(res.payload, "Regression Check R2->R1")
+        self.assertEqual(res.initial_ttl, 8)
+        self.assertEqual(res.final_ttl, 6)
+        self.assertEqual(res.hops_traversed, ["R2", "R3", "R1"])
+        self.assertIn("delivered to R1", res.summary)
+
+        # Inspect hop steps
+        self.assertEqual(len(res.steps), 3)
+        # Step 1: at R2, forward to R3, TTL 8 -> 7
+        self.assertEqual(res.steps[0].current_node, "R2")
+        self.assertEqual(res.steps[0].next_hop, "R3")
+        self.assertEqual(res.steps[0].incoming_ttl, 8)
+        self.assertEqual(res.steps[0].outgoing_ttl, 7)
+        self.assertEqual(res.steps[0].action, "FORWARD")
+
+        # Step 2: at R3, forward to R1, TTL 7 -> 6
+        self.assertEqual(res.steps[1].current_node, "R3")
+        self.assertEqual(res.steps[1].next_hop, "R1")
+        self.assertEqual(res.steps[1].incoming_ttl, 7)
+        self.assertEqual(res.steps[1].outgoing_ttl, 6)
+        self.assertEqual(res.steps[1].action, "FORWARD")
+
+        # Step 3: at R1, terminal delivery, TTL 6
+        self.assertEqual(res.steps[2].current_node, "R1")
+        self.assertIsNone(res.steps[2].next_hop)
+        self.assertEqual(res.steps[2].incoming_ttl, 6)
+        self.assertEqual(res.steps[2].outgoing_ttl, 6)
+        self.assertEqual(res.steps[2].action, "DELIVERY")
+        self.assertEqual(res.steps[2].status, "DELIVERED")
+
+    def test_simulate_packet_forwarding_r2_to_r1_unweighted(self):
+        """Verify exact R2 -> R1 unweighted simulation delivers to R1 directly in 1 hop."""
+        res = simulate_packet_forwarding(
+            self.topo,
+            source="R2",
+            destination="R1",
+            payload="Unweighted direct",
+            initial_ttl=8,
+            routing_mode="unweighted",
+        )
+
+        self.assertTrue(res.delivered)
+        self.assertEqual(res.status, "DELIVERED")
+        self.assertEqual(res.hops_traversed, ["R2", "R1"])
+        self.assertEqual(res.final_ttl, 7)
+        self.assertEqual(len(res.steps), 2)
+        self.assertEqual(res.steps[0].current_node, "R2")
+        self.assertEqual(res.steps[0].next_hop, "R1")
+        self.assertEqual(res.steps[1].current_node, "R1")
+        self.assertEqual(res.steps[1].status, "DELIVERED")
+
 
 if __name__ == "__main__":
     unittest.main()
