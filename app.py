@@ -168,7 +168,10 @@ st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 # -----------------------------------------------------------------------------
 # Session State Initialization
 # -----------------------------------------------------------------------------
-if "topology" not in st.session_state:
+if (
+    "topology" not in st.session_state
+    or not isinstance(st.session_state.get("topology"), NetworkTopology)
+):
     st.session_state["topology"] = create_demo_topology()
 if "failed_links" not in st.session_state:
     st.session_state["failed_links"] = set()
